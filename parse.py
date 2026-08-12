@@ -278,4 +278,177 @@ def github_blob_to_raw(url: str) -> str:
 
 
 def resolve_github_raw_url_from_source(source_href: str) -> Optional[str]:
-    if source_href.startswith("h
+    if source_href.startswith("https://raw.githubusercontent.com/"):
+        return source_href
+    if "github.com/Azure/azure-policy" in source_href:
+        return github_blob_to_raw(source_href)
+    try:
+        resp = requests.get(source_href, allow_redirects=True, timeout=30)
+        resp.raise_for_status()
+        if "github.com/Azure/azure-policy" in resp.url:
+            return github_blob_to_raw(resp.url)
+    except Exception as e:
+        print(f"Warning: failed to resolve GitHub URL for {source_href}: {e}", file=sys.stderr)
+    return None
+
+
+# Microsoft uses two CMA numbering variants in the wild: "CMA_0024" and
+# "CMA_C1725" (an optional single letter before the digits).
+CMA_ID_REGEX = re.compile(r"(CMA_[A-Z]?\d+)")
+
+
+def extract_cma_id(policy_json: Optional[dict], description: str) -> str:
+    """
+    Detect whether a policy is one of Microsoft's manual-attestation
+    "CMA_####" / "CMA_C####" policies. Microsoft injects these into rigid frameworks like
+    NIST 800-53 to cover controls automated scanners can't check (e.g.
+    physical background checks, paper key storage). Real examples live at
+    built-in-policies/policyDefinitions/Regulatory Compliance/CMA_####.json
+    in the Azure/azure-policy repo -- each has its own real policy GUID, but
+    carries the CMA_#### token in two places:
+      1. properties.metadata.additionalMetadataId
+         ("/providers/Microsoft.PolicyInsights/policyMetadata/CMA_0024")
+      2. properties.description (Microsoft prefixes these "CMA_0024 - ...")
+
+    Returns the CMA id (e.g. "CMA_0024") if the policy is one of these,
+    otherwise "" (most policies -- the automated ones -- are not).
+    """
+    if isinstance(policy_json, dict):
+        props = policy_json.get("properties", {})
+        metadata = props.get("metadata", {}) if isinstance(props, dict) else {}
+        additional_metadata_id = (
+            metadata.get("additionalMetadataId", "") if isinstance(metadata, dict) else ""
+        )
+        m = CMA_ID_REGEX.search(additional_metadata_id)
+        if m:
+            return m.group(1)
+
+    m = CMA_ID_REGEX.search(description or "")
+    return m.group(1) if m else ""
+
+
+def fetch_policy_json(raw_url: str) -> Optional[dict]:
+    try:
+        resp = requests.get(raw_url, timeout=30)
+        resp.raise_for_status()
+        return resp.json()
+    except Exception as e:
+        print(f"Warning: failed to fetch/parse policy json from {raw_url}: {e}", file=sys.stderr)
+        return None
+
+
+# ----------------------------
+# MAIN FLOW
+# ----------------------------
+
+def main():
+    parser = argparse.ArgumentParser(description="Extract MCSB control IDs for Azure built-in policy definitions.")
+    parser.add_argument(
+        "-i", "--input",
+        default=DEFAULT_POLICY_IDS_FILE,
+        help=f"Path to a text file with one policy GUID per line (default: {DEFAULT_POLICY_IDS_FILE})",
+    )
+    parser.add_argument(
+        "-o", "--output",
+        default=OUTPUT_CSV,
+        help=f"Path to write the output CSV (default: {OUTPUT_CSV})",
+    )
+    args = parser.parse_args()
+
+    policy_ids = load_policy_ids(Path(args.input))
+    print(f"Loaded {len(policy_ids)} policy IDs from {args.input}")
+
+    print(f"Fetching MCSB control-id mapping from {MCSB_INITIATIVE_RAW_URL} ...")
+    mcsb_lookup = build_mcsb_lookup()
+    print(f"Built MCSB lookup for {len(mcsb_lookup)} policies.")
+
+    print(f"Fetching built-in policy index from {BUILTIN_INDEX_URL} ...")
+    index_html = fetch(BUILTIN_INDEX_URL).text
+    index_map = parse_builtin_index(index_html)
+    index_map = {k.lower(): v for k, v in index_map.items()}
+    print(f"Parsed {len(index_map)} built-in policies from index.")
+
+    github_token = get_github_token()
+    if not github_token:
+        print(
+            "Note: no GITHUB_TOKEN/GH_TOKEN set. Policies not listed on the docs index "
+            "(e.g. manual-attestation CMA_#### policies) will be skipped and their cmaId "
+            "left blank. Set GITHUB_TOKEN to enable the GitHub search fallback for those.",
+            file=sys.stderr,
+        )
+
+    out_path = Path(args.output)
+    out_file = out_path.open("w", newline="", encoding="utf-8")
+    writer = csv.writer(out_file)
+    writer.writerow(
+        [
+            "policyId",
+            "mcsbId",
+            "cmaId",
+            "policyName",
+            "policyDisplayName",
+            "policyDescription",
+            "mcsbSource",
+            "githubRawUrl",
+        ]
+    )
+
+    for pid in policy_ids:
+        pid_l = pid.lower()
+        info = index_map.get(pid_l, {})
+
+        # MCSB IDs now come straight from the initiative lookup, not from
+        # parsing the individual policy's metadata.
+        mcsb_ids = mcsb_lookup.get(pid_l, [])
+        mcsb_source = MCSB_INITIATIVE_RAW_URL if mcsb_ids else ""
+
+        source_href = info.get("source_href", "")
+        github_raw_url = resolve_github_raw_url_from_source(source_href) if source_href else None
+
+        # Not on the docs index (common for CMA_#### manual-attestation
+        # policies) -- fall back to locating the file via GitHub search.
+        if not github_raw_url and github_token:
+            found_path = find_policy_path_via_github_search(pid, github_token)
+            if found_path:
+                github_raw_url = f"{GITHUB_REPO_RAW_ROOT}/{quote(found_path, safe='/')}"
+
+        display_name = ""
+        description = ""
+        policy_json = None
+        if github_raw_url:
+            policy_json = fetch_policy_json(github_raw_url)
+            if policy_json:
+                props = policy_json.get("properties", {})
+                display_name = props.get("displayName", "")
+                description = props.get("description", "")
+
+        # Fall back to the docs-index description if the GitHub JSON didn't have one.
+        if not description:
+            description = info.get("description", "")
+
+        cma_id = extract_cma_id(policy_json, description)
+
+        if not mcsb_ids:
+            print(f"Note: no MCSB mapping found for {pid} (not in MCSBv2.json).", file=sys.stderr)
+        if cma_id:
+            print(f"Note: {pid} is a manual attestation policy ({cma_id}).", file=sys.stderr)
+
+        writer.writerow(
+            [
+                pid,
+                ",".join(mcsb_ids),
+                cma_id,
+                info.get("name", ""),
+                display_name,
+                description,
+                mcsb_source,
+                github_raw_url or "",
+            ]
+        )
+
+    out_file.close()
+    print(f"Done. Wrote mapping to {out_path.resolve()}")
+
+
+if __name__ == "__main__":
+    main()
