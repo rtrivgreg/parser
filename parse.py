@@ -74,84 +74,89 @@ def fetch(url: str, session: Optional[requests.Session] = None) -> requests.Resp
 
 def parse_builtin_index(html: str) -> Dict[str, Dict[str, str]]:
     """
-    Parse the built-in policy index page and produce:
+    Parse the current Microsoft built-in policy index page.
 
-        { policyGuid: {"name": ..., "description": ..., "source_href": ...} }
+    Expected current layout:
+      | Name (Azure portal) | Description | Effect(s) | Version (GitHub) |
 
-    Assumptions (based on current docs structure):
-
-    - The page contains one or more tables listing:
-        Name | Description | Effect(s) | Source
-    - The policy GUID is embedded in the Source link URL (GitHub path) or
-      in a '.../policyDefinitions/<guid>' part of the portal URL.
+    Returns:
+        {
+            policy_guid: {
+                "name": <portal link text>,
+                "description": <description text>,
+                "source_href": <GitHub source link from Version column>,
+                "portal_href": <Azure portal link>,
+                "version": <version text>,
+            }
+        }
     """
     soup = BeautifulSoup(html, "html.parser")
     guid_map: Dict[str, Dict[str, str]] = {}
 
-    # Find all HTML tables in the document and scan rows
-    tables = soup.find_all("table")
-    for table in tables:
-        # Heuristic: look at the header to see if it matches the built-in policy layout
-        header = table.find("thead")
-        if not header:
-            continue
-        th_texts = [th.get_text(strip=True).lower() for th in header.find_all("th")]
-        # Expect columns like "name", "description", "effect(s)", "source"
-        if not ("name" in th_texts and "source" in th_texts):
+    for table in soup.find_all("table"):
+        rows = table.find_all("tr")
+        if not rows:
             continue
 
-        # Map column index -> logical name
-        col_map = {}
-        for idx, text in enumerate(th_texts):
-            if "name" in text:
-                col_map["name"] = idx
-            elif "description" in text:
-                col_map["description"] = idx
-            elif "source" in text:
-                col_map["source"] = idx
+        header_cells = rows[0].find_all(["th", "td"])
+        headers = [c.get_text(" ", strip=True).lower() for c in header_cells]
 
-        # Now parse all body rows
-        for row in table.find_all("tr"):
-            tds = row.find_all("td")
-            if not tds or len(tds) < len(col_map):
+        # Current docs usually use these columns.
+        # Be tolerant to wording changes such as Source vs Version.
+        has_name = any("name" in h for h in headers)
+        has_description = any("description" in h for h in headers)
+        has_version_or_source = any(("version" in h) or ("source" in h) for h in headers)
+
+        if not (has_name and has_description and has_version_or_source):
+            continue
+
+        def find_col(*needles: str) -> Optional[int]:
+            for i, h in enumerate(headers):
+                if all(n in h for n in needles):
+                    return i
+            return None
+
+        name_idx = find_col("name")
+        desc_idx = find_col("description")
+        version_idx = find_col("version")
+        if version_idx is None:
+            version_idx = find_col("source")
+
+        if name_idx is None or desc_idx is None or version_idx is None:
+            continue
+
+        for row in rows[1:]:
+            cells = row.find_all("td")
+            if len(cells) <= max(name_idx, desc_idx, version_idx):
                 continue
 
-            name = tds[col_map["name"]].get_text(strip=True) if "name" in col_map else ""
-            description = (
-                tds[col_map["description"]].get_text(strip=True)
-                if "description" in col_map
-                else ""
-            )
+            name_cell = cells[name_idx]
+            desc_cell = cells[desc_idx]
+            version_cell = cells[version_idx]
 
-            source_href = ""
-            if "source" in col_map:
-                source_cell = tds[col_map["source"]]
-                a = source_cell.find("a", href=True)
-                if a:
-                    source_href = a["href"]
+            portal_a = name_cell.find("a", href=True)
+            source_a = version_cell.find("a", href=True)
 
-            if not source_href:
-                continue
+            portal_href = portal_a["href"].strip() if portal_a else ""
+            source_href = source_a["href"].strip() if source_a else ""
 
-            # Try to extract policy GUID from the source link (or name link if needed)
-            guid = extract_guid_from_url(source_href)
-            if not guid:
-                # As a fallback, also look for GUID in the name link (portal URL)
-                name_link = tds[col_map["name"]].find("a", href=True)
-                if name_link:
-                    guid = extract_guid_from_url(name_link["href"])
+            # Prefer extracting GUID from the portal link first.
+            guid = extract_guid_from_url(portal_href)
+            if not guid and source_href:
+                guid = extract_guid_from_url(source_href)
 
             if not guid:
                 continue
 
             guid_map[guid.lower()] = {
-                "name": name,
-                "description": description,
+                "name": name_cell.get_text(" ", strip=True),
+                "description": desc_cell.get_text(" ", strip=True),
                 "source_href": source_href,
+                "portal_href": portal_href,
+                "version": version_cell.get_text(" ", strip=True),
             }
 
     return guid_map
-
 
 GUID_REGEX = re.compile(
     r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
