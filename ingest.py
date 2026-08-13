@@ -25,6 +25,7 @@ import json
 import os
 import re
 import sys
+import tarfile
 import time
 import urllib.request
 
@@ -52,6 +53,14 @@ MCSB_V2_DOMAIN_PAGES = [
 ]
 MCSB_V2_BASE = "https://learn.microsoft.com/en-us/security/benchmark/azure/mcsb-v2-{}"
 
+# Public tarball of the whole Azure/azure-policy repo - used only to resolve a
+# GUID -> human-readable policy display name. Streamed and filtered in memory
+# (no repo checkout, no GitHub API/auth needed) for every
+# built-in-policies/policyDefinitions/**/*.json file, then cached locally so
+# repeat runs don't re-download it.
+AZURE_POLICY_TARBALL_URL = "https://github.com/Azure/azure-policy/archive/refs/heads/master.tar.gz"
+POLICY_NAME_CACHE_FILENAME = ".azure_policy_names_cache.json"
+
 
 def fetch_json(url):
     req = urllib.request.Request(url, headers={"User-Agent": "python"})
@@ -76,6 +85,55 @@ def in_mcsb(guid, mcsb_defs):
         if d["policyDefinitionId"].lower().endswith(guid.lower()):
             return d.get("groupNames", [])
     return None
+
+
+def _policy_name_cache_path():
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), POLICY_NAME_CACHE_FILENAME)
+
+
+def build_policy_name_index(refresh=False, log=print):
+    """
+    Build a {guid_lowercase: displayName} index covering (almost) every
+    built-in Azure Policy definition, by streaming the public Azure/azure-policy
+    GitHub repo tarball and reading only the built-in-policies/policyDefinitions
+    /**/*.json files in memory - no repo checkout, no GitHub API/auth needed.
+
+    Cached to a local JSON file next to this script so repeat runs are
+    instant; pass refresh=True to force a re-download (e.g. if Microsoft adds
+    new built-in policies you need resolved).
+    """
+    cache_path = _policy_name_cache_path()
+    if not refresh and os.path.isfile(cache_path):
+        with open(cache_path, "r", encoding="utf-8") as f:
+            return json.load(f)
+
+    log("Downloading Azure built-in policy definitions (for name lookups) ...")
+    req = urllib.request.Request(AZURE_POLICY_TARBALL_URL, headers={"User-Agent": "python"})
+    index = {}
+    with urllib.request.urlopen(req) as resp:
+        with tarfile.open(fileobj=resp, mode="r|gz") as tar:
+            for member in tar:
+                if not member.isfile():
+                    continue
+                if ("/built-in-policies/policyDefinitions/" not in member.name
+                        or not member.name.endswith(".json")):
+                    continue
+                fobj = tar.extractfile(member)
+                if fobj is None:
+                    continue
+                try:
+                    d = json.loads(fobj.read().decode("utf-8-sig"))
+                except Exception:
+                    continue
+                guid = d.get("name")
+                display_name = (d.get("properties") or {}).get("displayName")
+                if guid and display_name:
+                    index[guid.lower()] = display_name
+
+    with open(cache_path, "w", encoding="utf-8") as f:
+        json.dump(index, f)
+    log(f"  cached {len(index)} policy names -> {cache_path}")
+    return index
 
 
 def fetch_text(url):
@@ -211,7 +269,7 @@ def build_nist_r5_to_mcsb_v2_index(sleep_seconds=0.5, verbose=False, log=print):
     return index
 
 
-def compute_results(guids, log=print):
+def compute_results(guids, log=print, resolve_names=True, refresh_names=False):
     """
     Resolve every guid to its NIST 800-53 R5 control(s), and to MCSB control(s)
     either via direct policyDefinitionId overlap or the scraped crosswalk
@@ -223,6 +281,7 @@ def compute_results(guids, log=print):
     from, so the two output modes can never drift out of sync:
         {
             "policy_guid": str,
+            "policy_name": str,        # "" if resolve_names=False or unresolved
             "nist_control": str,       # "" when the guid wasn't found at all
             "match_type": str,         # not_found | direct_mcsb_policy |
                                         # crosswalk_fallback | no_mcsb_mapping
@@ -233,6 +292,10 @@ def compute_results(guids, log=print):
     nist_defs = load_policy_defs(NIST_R5_URL)
     log("Downloading MCSB (AzureSecurityCenter) initiative ...")
     mcsb_defs = load_policy_defs(MCSB_URL)
+
+    name_index = {}
+    if resolve_names:
+        name_index = build_policy_name_index(refresh=refresh_names, log=log)
 
     # Resolve every guid's NIST control(s) first, so we only build the (slower,
     # ~12-page) web-scraped fallback index if at least one guid actually needs it.
@@ -253,15 +316,18 @@ def compute_results(guids, log=print):
 
     rows = []
     for guid, groups, mcsb_groups in resolved:
+        policy_name = name_index.get(guid.lower(), "")
         if groups is None:
-            rows.append({"policy_guid": guid, "nist_control": "",
-                         "match_type": "not_found", "mcsb_controls": []})
+            rows.append({"policy_guid": guid, "policy_name": policy_name,
+                         "nist_control": "", "match_type": "not_found",
+                         "mcsb_controls": []})
             continue
         nist_controls = sorted({g.replace("NIST_SP_800-53_R5_", "") for g in groups})
 
         if mcsb_groups:
             for nist_id in nist_controls:
-                rows.append({"policy_guid": guid, "nist_control": nist_id,
+                rows.append({"policy_guid": guid, "policy_name": policy_name,
+                             "nist_control": nist_id,
                              "match_type": "direct_mcsb_policy",
                              "mcsb_controls": list(mcsb_groups)})
             continue
@@ -270,11 +336,13 @@ def compute_results(guids, log=print):
             base_id = nist_id.split("(")[0].strip()
             mcsb_controls = fallback_index.get(base_id)
             if mcsb_controls:
-                rows.append({"policy_guid": guid, "nist_control": nist_id,
+                rows.append({"policy_guid": guid, "policy_name": policy_name,
+                             "nist_control": nist_id,
                              "match_type": "crosswalk_fallback",
                              "mcsb_controls": sorted(mcsb_controls)})
             else:
-                rows.append({"policy_guid": guid, "nist_control": nist_id,
+                rows.append({"policy_guid": guid, "policy_name": policy_name,
+                             "nist_control": nist_id,
                              "match_type": "no_mcsb_mapping", "mcsb_controls": []})
     return rows
 
@@ -294,7 +362,9 @@ def print_report(rows):
         by_guid.setdefault(row["policy_guid"], []).append(row)
 
     for guid, guid_rows in by_guid.items():
-        print(f"\n=== {guid} ===")
+        name = guid_rows[0].get("policy_name")
+        header = f"\n=== {guid} ({name}) ===" if name else f"\n=== {guid} ==="
+        print(header)
         if guid_rows[0]["match_type"] == "not_found":
             print(f"  {_MATCH_TYPE_TEXT['not_found']}")
             continue
@@ -325,7 +395,7 @@ def write_csv(rows, dest):
     readable without relying on the reader to unquote correctly).
     `dest` is a file path, or "-" for stdout.
     """
-    fieldnames = ["policy_guid", "nist_control", "match_type", "mcsb_controls"]
+    fieldnames = ["policy_guid", "policy_name", "nist_control", "match_type", "mcsb_controls"]
     out = sys.stdout if dest == "-" else open(dest, "w", newline="", encoding="utf-8")
     try:
         writer = csv.DictWriter(out, fieldnames=fieldnames)
@@ -333,6 +403,7 @@ def write_csv(rows, dest):
         for row in rows:
             writer.writerow({
                 "policy_guid": row["policy_guid"],
+                "policy_name": row.get("policy_name", ""),
                 "nist_control": row["nist_control"],
                 "match_type": row["match_type"],
                 "mcsb_controls": ";".join(row["mcsb_controls"]),
@@ -342,11 +413,12 @@ def write_csv(rows, dest):
             out.close()
 
 
-def main(guids, csv_dest=None):
+def main(guids, csv_dest=None, resolve_names=True, refresh_names=False):
     # When writing CSV to stdout, keep progress/log noise out of that stream
     # (it would corrupt the CSV) by sending it to stderr instead.
     log = (lambda *a: print(*a, file=sys.stderr)) if csv_dest else print
-    rows = compute_results(guids, log=log)
+    rows = compute_results(guids, log=log, resolve_names=resolve_names,
+                            refresh_names=refresh_names)
     if csv_dest:
         write_csv(rows, csv_dest)
     else:
@@ -390,11 +462,20 @@ def parse_args(argv):
         python nist_to_mcsb.py --file guids.txt --csv
         python nist_to_mcsb.py --file guids.txt --csv=results.csv
 
-    Returns (guids_or_None, csv_dest_or_None). csv_dest is "-" for stdout,
-    a file path, or None to use the default human-readable text report.
+        # policy display names are resolved and included by default (both in
+        # the text report header and as a "policy_name" CSV column); disable
+        # for speed, or force a re-download of the name index:
+        python nist_to_mcsb.py --file guids.txt --csv --no-names
+        python nist_to_mcsb.py --file guids.txt --csv --refresh-names
+
+    Returns (guids_or_None, csv_dest_or_None, resolve_names, refresh_names).
+    csv_dest is "-" for stdout, a file path, or None to use the default
+    human-readable text report.
     """
     guids = []
     csv_dest = None
+    resolve_names = True
+    refresh_names = False
     i = 0
     while i < len(argv):
         arg = argv[i]
@@ -403,6 +484,12 @@ def parse_args(argv):
             i += 1
         elif arg.startswith("--csv="):
             csv_dest = arg.split("=", 1)[1]
+            i += 1
+        elif arg == "--no-names":
+            resolve_names = False
+            i += 1
+        elif arg == "--refresh-names":
+            refresh_names = True
             i += 1
         elif arg in ("--file", "-f"):
             if i + 1 >= len(argv):
@@ -416,11 +503,11 @@ def parse_args(argv):
     if len(guids) == 1 and (guids[0] == "-" or os.path.isfile(guids[0])):
         guids = load_guids_from_file(guids[0])
 
-    return (guids or None), csv_dest
+    return (guids or None), csv_dest, resolve_names, refresh_names
 
 
 if __name__ == "__main__":
-    guids, csv_dest = parse_args(sys.argv[1:])
+    guids, csv_dest, resolve_names, refresh_names = parse_args(sys.argv[1:])
     guids = guids or [
         "59f7feff-02aa-6539-2cf7-bea75b762140",
         "b1666a13-8f67-9c47-155e-69e027ff6823",
@@ -432,4 +519,4 @@ if __name__ == "__main__":
     ]
     if not guids:
         sys.exit("No GUIDs found in input.")
-    main(guids, csv_dest=csv_dest)
+    main(guids, csv_dest=csv_dest, resolve_names=resolve_names, refresh_names=refresh_names)
